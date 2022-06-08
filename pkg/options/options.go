@@ -27,31 +27,33 @@ import (
 	kcpinformer "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/rootapiserver"
-	manifestworksoptions "open-cluster-management.io/ocm-virtual-workspace/pkg/manifestwork/options"
+	ocmoptions "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/options"
+
+	workinformer "open-cluster-management.io/api/client/work/informers/externalversions"
 )
 
 const virtualWorkspacesFlagPrefix = "virtual-workspaces-"
 
 type Options struct {
-	ManifestWorks *manifestworksoptions.ManifestWorks
+	OCM *ocmoptions.OCM
 }
 
 func NewOptions() *Options {
 	return &Options{
-		ManifestWorks: manifestworksoptions.NewManifestWorks(),
+		OCM: ocmoptions.NewOCM(),
 	}
 }
 
 func (v *Options) Validate() []error {
 	var errs []error
 
-	errs = append(errs, v.ManifestWorks.Validate(virtualWorkspacesFlagPrefix)...)
+	errs = append(errs, v.OCM.Validate(virtualWorkspacesFlagPrefix)...)
 
 	return errs
 }
 
 func (v *Options) AddFlags(fs *pflag.FlagSet) {
-	v.ManifestWorks.AddFlags(fs, virtualWorkspacesFlagPrefix)
+	v.OCM.AddFlags(fs, virtualWorkspacesFlagPrefix)
 }
 
 func (o *Options) NewVirtualWorkspaces(
@@ -61,9 +63,10 @@ func (o *Options) NewVirtualWorkspaces(
 	kcpClusterClient kcpclient.ClusterInterface,
 	wildcardKubeInformers informers.SharedInformerFactory,
 	wildcardKcpInformers kcpinformer.SharedInformerFactory,
+	workinformer workinformer.SharedInformerFactory,
 ) (extraInformers []rootapiserver.InformerStart, workspaces []framework.VirtualWorkspace, err error) {
 
-	inf, vws, err := o.ManifestWorks.NewVirtualWorkspaces(rootPathPrefix, kubeClusterClient, dynamicClusterClient, kcpClusterClient, wildcardKubeInformers, wildcardKcpInformers)
+	inf, vws, err := o.OCM.NewVirtualWorkspaces(rootPathPrefix, kubeClusterClient, dynamicClusterClient, kcpClusterClient, wildcardKubeInformers, wildcardKcpInformers, workinformer)
 	if err != nil {
 		return nil, nil, err
 	}

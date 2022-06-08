@@ -1,0 +1,9 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: case1
+rules:
+- apiGroups: ["work.open-cluster-management.io"]
+  resources: ["manifestworks"]
+  resourceNames: ["work1"]
+  verbs: ["get", "list", "watch"]

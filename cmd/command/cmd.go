@@ -17,6 +17,7 @@ limitations under the License.
 package command
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -34,6 +35,7 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/version"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/component-base/config"
@@ -43,6 +45,9 @@ import (
 	kcpinformer "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	virtualrootapiserver "github.com/kcp-dev/kcp/pkg/virtual/framework/rootapiserver"
 	"open-cluster-management.io/ocm-virtual-workspace/cmd/options"
+
+	workclientset "open-cluster-management.io/api/client/work/clientset/versioned"
+	workinformer "open-cluster-management.io/api/client/work/informers/externalversions"
 )
 
 func NewCommand(errout io.Writer, stopCh <-chan struct{}) *cobra.Command {
@@ -52,7 +57,7 @@ func NewCommand(errout io.Writer, stopCh <-chan struct{}) *cobra.Command {
 	opts.Logs.Config.Verbosity = config.VerbosityLevel(2)
 
 	cmd := &cobra.Command{
-		Use:   "manifestworks",
+		Use:   "ocm",
 		Short: "Launch OCM virtual workspace apiserver",
 		Long:  "Start a virtual workspace apiserver to manage ocm virtual workspace",
 
@@ -110,8 +115,20 @@ func Run(o *options.Options, stopCh <-chan struct{}) error {
 	wildcardKcpClient := kcpClusterClient.Cluster(logicalcluster.Wildcard)
 	wildcardKcpInformers := kcpinformer.NewSharedInformerFactory(wildcardKcpClient, 10*time.Minute)
 
+	restConfig := rest.CopyConfig(kubeClientConfig)
+	restConfig.Host += "/clusters/*"
+
+	fmt.Printf("++++>Run(): kubeClientConfig.Host=%s\n", kubeClientConfig.Host)
+
+	manifestWorkClient, err := workclientset.NewForConfig(restConfig)
+	if err != nil {
+		return err
+	}
+	// Only watch the cluster namespace on hub
+	manifestWorkInformers := workinformer.NewSharedInformerFactory(manifestWorkClient, 10*time.Minute)
+
 	// create apiserver
-	extraInformerStarts, virtualWorkspaces, err := o.VirtualWorkspaces.NewVirtualWorkspaces(o.RootPathPrefix, kubeClusterClient, dynamicClusterClient, kcpClusterClient, wildcardKubeInformers, wildcardKcpInformers)
+	extraInformerStarts, virtualWorkspaces, err := o.VirtualWorkspaces.NewVirtualWorkspaces(o.RootPathPrefix, kubeClusterClient, dynamicClusterClient, kcpClusterClient, wildcardKubeInformers, wildcardKcpInformers, manifestWorkInformers)
 	if err != nil {
 		return err
 	}
@@ -128,6 +145,7 @@ func Run(o *options.Options, stopCh <-chan struct{}) error {
 	rootAPIServerConfig, err := virtualrootapiserver.NewRootAPIConfig(recommendedConfig, append(extraInformerStarts,
 		wildcardKubeInformers.Start,
 		wildcardKcpInformers.Start,
+		manifestWorkInformers.Start,
 	), virtualWorkspaces...)
 	if err != nil {
 		return err
