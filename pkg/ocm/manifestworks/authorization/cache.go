@@ -554,8 +554,9 @@ func (ac *AuthorizationCache) List(userInfo user.Info, labelSelector labels.Sele
 
 		// only match selected labels and fields
 
-		predicate := manifestworkutil.MatchWorkspace(labelSelector, fieldSelector)
+		predicate := manifestworkutil.MatchManifestWork(labelSelector, fieldSelector)
 		if matches, err := predicate.Matches(manifestWork); err != nil || !matches {
+			fmt.Printf("++++>AuthorizationCache[%s].List(): name=%s, matched=false, error=%v\n", ac.clusterName.String(), manifestWork.Name, err)
 			continue
 		}
 

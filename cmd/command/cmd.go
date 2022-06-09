@@ -128,7 +128,14 @@ func Run(o *options.Options, stopCh <-chan struct{}) error {
 	manifestWorkInformers := workinformer.NewSharedInformerFactory(manifestWorkClient, 10*time.Minute)
 
 	// create apiserver
-	extraInformerStarts, virtualWorkspaces, err := o.VirtualWorkspaces.NewVirtualWorkspaces(o.RootPathPrefix, kubeClusterClient, dynamicClusterClient, kcpClusterClient, wildcardKubeInformers, wildcardKcpInformers, manifestWorkInformers)
+	extraInformerStarts, virtualWorkspaces, err := o.VirtualWorkspaces.NewVirtualWorkspaces(
+		o.RootPathPrefix,
+		kubeClusterClient,
+		dynamicClusterClient,
+		kcpClusterClient,
+		wildcardKubeInformers,
+		wildcardKcpInformers,
+		manifestWorkInformers.Work().V1().ManifestWorks())
 	if err != nil {
 		return err
 	}

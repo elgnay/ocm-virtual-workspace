@@ -30,7 +30,7 @@ import (
 	manifestworkauth "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/authorization"
 	"open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/registry"
 
-	workinformer "open-cluster-management.io/api/client/work/informers/externalversions/work/v1"
+	manifestworkinformer "open-cluster-management.io/api/client/work/informers/externalversions/work/v1"
 	workapiv1 "open-cluster-management.io/api/work/v1"
 
 	"github.com/kcp-dev/logicalcluster"
@@ -52,13 +52,13 @@ type authCacheManifestWorks struct {
 // CreateAndStartOrg creates an Org that contains all the required clients and caches to retrieve user workspaces inside an org
 // As part of an Org, a WorkspaceAuthCache is created and ensured to be started.
 func CreateAndStartManifestWorkWorkspace(
-	lclusterName logicalcluster.Name,
+	clusterName logicalcluster.Name,
 	rbacInformers rbacinformers.Interface,
-	manifestWorkInformer workinformer.ManifestWorkInformer,
+	manifestWorkInformer manifestworkinformer.ManifestWorkInformer,
 	initialWatchers []manifestworkauth.CacheWatcher,
 ) *authCacheManifestWorks {
 	authCache := manifestworkauth.NewAuthorizationCache(
-		lclusterName,
+		clusterName,
 		manifestWorkInformer.Lister(),
 		manifestWorkInformer.Informer(),
 		manifestworkauth.NewReviewer(frameworkrbac.NewSubjectLocator(rbacInformers)),

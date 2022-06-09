@@ -19,28 +19,42 @@ package registry
 import (
 	"context"
 	"fmt"
-
-	"github.com/kcp-dev/logicalcluster"
+	"reflect"
+	"sort"
+	"strings"
+	"unsafe"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternal "k8s.io/apimachinery/pkg/apis/meta/internalversion"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	rbacinformers "k8s.io/client-go/informers/rbac/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/printers"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
+	tenancyv1beta1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1beta1"
+	"github.com/kcp-dev/kcp/pkg/authorization/delegated"
+	"github.com/kcp-dev/logicalcluster"
 	manifestworkauth "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/authorization"
-
 	manifestworkprinters "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/printers"
+	"open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/projection"
+	ocmworkspace "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/workspace"
 
 	workapiv1 "open-cluster-management.io/api/work/v1"
 
+	//"open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/common"
 	manifestworkcache "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/cache"
 )
 
@@ -60,33 +74,25 @@ type FilteredManifestWorkWorkspace interface {
 	Stop()
 }
 
-type WorkspacesScopeKeyType string
-
-const (
-	WorkspacesManagedClusterKey WorkspacesScopeKeyType = "VirtualWorkspaceManagedCluster"
-	WorkspacesOrgKey            WorkspacesScopeKeyType = "VirtualWorkspaceWorkspacesOrg"
-)
-
 type REST struct {
 	// clusterWorkspaceCache is a global cache of cluster workspaces (for all orgs) used by the watcher.
 	manifestworkCache *manifestworkcache.ManifestWorkCache
 
 	// getFilteredClusterWorkspaces returns a provider for ClusterWorkspaces.
-	getManifestWorkWorkspace func(orgClusterName logicalcluster.Name) FilteredManifestWorkWorkspace
+	getManifestWorkWorkspaces func() map[logicalcluster.Name]FilteredManifestWorkWorkspace
 
-	listWorkspaceNames        func() []logicalcluster.Name
-	getManifestWorkWorkspaces func() []FilteredManifestWorkWorkspace
+	kubeClusterClient kubernetes.ClusterInterface
 
+	// delegatedAuthz implements cluster-aware SubjectAccessReview
+	delegatedAuthz delegated.DelegatedAuthorizerFactory
 	/*
 
 		// crbInformer allows listing or searching for RBAC cluster role bindings through all orgs
 		crbInformer rbacinformers.ClusterRoleBindingInformer
 
-		kubeClusterClient kubernetes.ClusterInterface
+
 		kcpClusterClient  kcpclientset.ClusterInterface
 
-		// delegatedAuthz implements cluster-aware SubjectAccessReview
-		delegatedAuthz delegated.DelegatedAuthorizerFactory
 
 		createStrategy rest.RESTCreateStrategy
 		updateStrategy rest.RESTUpdateStrategy
@@ -130,29 +136,25 @@ var _ rest.GracefulDeleter = &REST{}
 // org workspaces, projecting them to the Workspace type.
 func NewREST(
 	manifestworkCache *manifestworkcache.ManifestWorkCache,
+	kubeClusterClient kubernetes.ClusterInterface,
 	/*
 		rootTenancyClient tenancyclient.TenancyV1alpha1Interface,
-		kubeClusterClient kubernetes.ClusterInterface,
 		kcpClusterClient kcpclientset.ClusterInterface,
-
 		wilcardsCRBInformer rbacinformers.ClusterRoleBindingInformer,
 		getFilteredClusterWorkspaces func(orgClusterName logicalcluster.Name) FilteredClusterWorkspaces,
 	*/
-	listWorkspaceNames func() []logicalcluster.Name,
-	getManifestWorkWorkspace func(orgClusterName logicalcluster.Name) FilteredManifestWorkWorkspace,
-	getManifestWorkWorkspaces func() []FilteredManifestWorkWorkspace,
+	getManifestWorkWorkspaces func() map[logicalcluster.Name]FilteredManifestWorkWorkspace,
 ) *REST {
 	mainRest := &REST{
 		manifestworkCache:         manifestworkCache,
-		getManifestWorkWorkspace:  getManifestWorkWorkspace,
-		listWorkspaceNames:        listWorkspaceNames,
 		getManifestWorkWorkspaces: getManifestWorkWorkspaces,
+		delegatedAuthz:            delegated.NewDelegatedAuthorizer,
+		kubeClusterClient:         kubeClusterClient,
 		/*
 			getFilteredClusterWorkspaces: getFilteredClusterWorkspaces,
 
-			kubeClusterClient: kubeClusterClient,
+
 			kcpClusterClient:  kcpClusterClient,
-			delegatedAuthz:    delegated.NewDelegatedAuthorizer,
 
 			crbInformer: wilcardsCRBInformer,
 
@@ -215,20 +217,20 @@ func (s *REST) getInternalNameFromPrettyName(user kuser.Info, orgClusterName log
 	}
 	return "", kerrors.NewNotFound(tenancyv1beta1.Resource("workspaces"), prettyName)
 }
-
-func (s *REST) authorizeOrgForUser(ctx context.Context, orgClusterName logicalcluster.Name, user user.Info, verb string) error {
+*/
+func (s *REST) authorizeWorkspaceForUser(ctx context.Context, clusterName logicalcluster.Name, user user.Info, verb string) error {
 	// Root org access is implicit for every user. For non-root orgs, we need to check for
 	// verb=access permissions against the clusterworkspaces/content of the ClusterWorkspace of
 	// the org in the root.
-	if orgClusterName == tenancyv1alpha1.RootCluster || sets.NewString(user.GetGroups()...).Has("system:masters") {
+	if clusterName == tenancyv1alpha1.RootCluster || sets.NewString(user.GetGroups()...).Has("system:masters") {
 		return nil
 	}
 
-	parent, orgName := orgClusterName.Split()
+	parent, workspace := clusterName.Split()
 	authz, err := s.delegatedAuthz(parent, s.kubeClusterClient)
 	if err != nil {
 		klog.Errorf("failed to get delegated authorizer for logical cluster %s", user.GetName(), parent)
-		return kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), orgName, fmt.Errorf("%q workspace access not permitted", parent))
+		return kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), workspace, fmt.Errorf("%q workspace access not permitted", parent))
 	}
 	typeUseAttr := authorizer.AttributesRecord{
 		User:            user,
@@ -237,86 +239,114 @@ func (s *REST) authorizeOrgForUser(ctx context.Context, orgClusterName logicalcl
 		APIVersion:      tenancyv1alpha1.SchemeGroupVersion.Version,
 		Resource:        "clusterworkspaces",
 		Subresource:     "content",
-		Name:            orgName,
+		Name:            workspace,
 		ResourceRequest: true,
 	}
 	if decision, reason, err := authz.Authorize(ctx, typeUseAttr); err != nil {
-		klog.Errorf("failed to authorize user %q to %q clusterworkspaces/content name %q in %s", user.GetName(), verb, orgName, parent)
-		return kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), orgName, fmt.Errorf("%q workspace access not permitted", parent))
+		klog.Errorf("failed to authorize user %q to %q clusterworkspaces/content name %q in %s", user.GetName(), verb, workspace, parent)
+		return kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), workspace, fmt.Errorf("%q workspace access not permitted", clusterName))
 	} else if decision != authorizer.DecisionAllow {
-		klog.Errorf("user %q lacks (%s) clusterworkspaces/content %q permission for %q in %s: %s", user.GetName(), decisions[decision], verb, orgName, parent, reason)
-		return kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), orgName, fmt.Errorf("%q workspace access not permitted", parent))
+		klog.Errorf("user %q lacks (%s) clusterworkspaces/content %q permission for %q in %s: %s", user.GetName(), decisions[decision], verb, workspace, parent, reason)
+		return kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), workspace, fmt.Errorf("%q workspace access not permitted", clusterName))
 	}
 
 	return nil
 }
-*/
 
 // List retrieves a list of Workspaces that match label.
 func (s *REST) List(ctx context.Context, options *metainternal.ListOptions) (runtime.Object, error) {
-	fmt.Printf("++++>ManifestWork.List(0)\n")
+	printContextInternals(ctx, false)
 	userInfo, ok := apirequest.UserFrom(ctx)
 	if !ok {
 		return nil, kerrors.NewForbidden(workapiv1.Resource("manifestworks"), "", fmt.Errorf("unable to list manifestworks without a user on the context"))
 	}
-	fmt.Printf("++++>List(1): userName=%s\n", userInfo.GetName())
-	/*
-		managedClusterName := ctx.Value(WorkspacesManagedClusterKey).(string)
-		fmt.Printf("++++>List(2): managedClusterName=%s\n", managedClusterName)
 
-		fmt.Printf("++++>List(3): orgClusterName=%v\n", ctx.Value(WorkspacesOrgKey))
-		orgClusterName := ctx.Value(WorkspacesOrgKey).(logicalcluster.Name)
-		fmt.Printf("++++>List(4): orgClusterName=%s\n", orgClusterName)
-	*/
-	/*
-		if err := s.authorizeOrgForUser(ctx, orgClusterName, userInfo, "access"); err != nil {
-			return nil, err
-		}
-	*/
+	value := ctx.Value(ocmworkspace.WorkspaceNameKey)
+	workspace := value.(logicalcluster.Name)
+	if err := s.authorizeWorkspaceForUser(ctx, workspace, userInfo, "access"); err != nil {
+		return nil, err
+	}
 
 	manifestworkList := &workapiv1.ManifestWorkList{}
 
+	value = ctx.Value(ocmworkspace.ManagedClusterNameKey)
+	managedClusterName := value.(string)
+	value = ctx.Value(ocmworkspace.NamespaceKey)
+	namespace := value.(string)
+	if managedClusterName != namespace {
+		return manifestworkList, nil
+	}
+
 	labelSelector, fieldSelector := InternalListOptionsToSelectors(options)
+
+	// only select manifestworks from the given cluster namespace
+	nsFiledSelector := fields.OneTermEqualSelector("metadata.namespace", managedClusterName)
+	if fieldSelector.Empty() {
+		fieldSelector = nsFiledSelector
+	} else {
+		fieldSelector = fields.AndSelectors(fieldSelector, nsFiledSelector)
+	}
+
 	for _, workspace := range s.getManifestWorkWorkspaces() {
 		matched, err := workspace.List(userInfo, labelSelector, fieldSelector)
 		if err != nil {
 			return nil, err
 		}
-
-		manifestworkList.Items = append(manifestworkList.Items, matched.Items...)
+		for _, work := range matched.Items {
+			manifestworkList.Items = append(manifestworkList.Items, projection.ProjectManifestWork(work))
+		}
 	}
 
-	/*
-
-
-		clusterWorkspaceList := &tenancyv1alpha1.ClusterWorkspaceList{}
-		if clusterWorkspaces := s.getFilteredClusterWorkspaces(orgClusterName); clusterWorkspaces != nil {
-			// TODO:
-			// The workspaceLister is informer driven, so it's important to note that the lister can be stale.
-			// It breaks the API guarantees of lists.
-			// To make it correct we have to know the latest RV of the org workspace shard,
-			// and then wait for freshness relative to that RV of the lister.
-			labelSelector, fieldSelector := InternalListOptionsToSelectors(options)
-			var err error
-			clusterWorkspaceList, err = clusterWorkspaces.List(userInfo, labelSelector, fieldSelector)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		workspaceList := &tenancyv1beta1.WorkspaceList{
-			ListMeta: clusterWorkspaceList.ListMeta,
-			Items:    make([]tenancyv1beta1.Workspace, len(clusterWorkspaceList.Items)),
-		}
-
-		for i, cws := range clusterWorkspaceList.Items {
-			projection.ProjectClusterWorkspaceToWorkspace(&cws, &workspaceList.Items[i])
-		}
-
-		return workspaceList, nil
-	*/
-
+	sort.Slice(manifestworkList.Items, func(i, j int) bool {
+		return manifestworkList.Items[i].Name < manifestworkList.Items[j].Name
+	})
 	return manifestworkList, nil
+}
+
+var _ = rest.Getter(&REST{})
+
+// Get retrieves a Workspace by name
+func (s *REST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	fmt.Printf("++++>REST.Get(): name=%s\n", name)
+
+	userInfo, ok := apirequest.UserFrom(ctx)
+	if !ok {
+		return nil, kerrors.NewForbidden(workapiv1.Resource("manifestworks"), "", fmt.Errorf("unable to get manifestwork without a user on the context"))
+	}
+
+	value := ctx.Value(ocmworkspace.ManagedClusterNameKey)
+	managedClusterName := value.(string)
+	value = ctx.Value(ocmworkspace.WorkspaceNameKey)
+	workspace := value.(logicalcluster.Name)
+	if err := s.authorizeWorkspaceForUser(ctx, workspace, userInfo, "access"); err != nil {
+		return nil, err
+	}
+
+	// only select manifestworks from the given cluster namespace
+	filedSelector := fields.OneTermEqualSelector("metadata.namespace", managedClusterName)
+	for clusterName, workspace := range s.getManifestWorkWorkspaces() {
+		fmt.Printf("++++>REST.Get(): checking workspace %q\n", clusterName.String())
+		projectedClusterName := strings.ReplaceAll(clusterName.String(), ":", "-")
+		prefix := fmt.Sprintf("%s-", projectedClusterName)
+		if !strings.HasPrefix(name, prefix) {
+			fmt.Printf("++++>REST.Get(): name %q has no prefix %q, skipped\n", name, prefix)
+			continue
+		}
+
+		matched, err := workspace.List(userInfo, labels.Everything(), fields.AndSelectors(
+			filedSelector,
+			fields.OneTermEqualSelector("metadata.name", strings.TrimPrefix(name, prefix))))
+		if err != nil {
+			return nil, err
+		}
+
+		if len(matched.Items) > 0 {
+			projected := projection.ProjectManifestWork(matched.Items[0])
+			return &projected, nil
+		}
+	}
+
+	return nil, kerrors.NewNotFound(workapiv1.Resource("manifestworks"), name)
 }
 
 /*
@@ -340,68 +370,6 @@ func (s *REST) Watch(ctx context.Context, options *metainternal.ListOptions) (wa
 
 	go watcher.Watch()
 	return watcher, nil
-}
-
-var _ = rest.Getter(&REST{})
-
-// Get retrieves a Workspace by name
-func (s *REST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	cws, err := s.getClusterWorkspace(ctx, name, options)
-	if err != nil {
-		return nil, err
-	}
-
-	var ws tenancyv1beta1.Workspace
-	projection.ProjectClusterWorkspaceToWorkspace(cws, &ws)
-	return &ws, nil
-}
-
-func (s *REST) getClusterWorkspace(ctx context.Context, name string, options *metav1.GetOptions) (*tenancyv1alpha1.ClusterWorkspace, error) {
-	opts := metav1.GetOptions{}
-	if options != nil {
-		opts = *options
-	}
-
-	userInfo, ok := apirequest.UserFrom(ctx)
-	if !ok {
-		return nil, kerrors.NewForbidden(tenancyv1beta1.Resource("workspaces"), "", fmt.Errorf("unable to list workspaces without a user on the context"))
-	}
-
-	orgClusterName := ctx.Value(WorkspacesOrgKey).(logicalcluster.Name)
-	if err := s.authorizeOrgForUser(ctx, orgClusterName, userInfo, "access"); err != nil {
-		return nil, err
-	}
-
-	clusterWorkspaces := s.getFilteredClusterWorkspaces(orgClusterName)
-	if clusterWorkspaces == nil {
-		return nil, kerrors.NewNotFound(tenancyv1beta1.Resource("workspaces"), name)
-	}
-	workspace, err := s.kcpClusterClient.Cluster(orgClusterName).TenancyV1alpha1().ClusterWorkspaces().Get(ctx, name, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO:
-	// Filtering by applying the lister operation might not be necessary anymore
-	// when using a semi-delegated authorizer in the workspaces virtual workspace that would
-	// delegate this authorization to the main KCP instance hosting the workspaces and RBAC rules
-	obj, err := clusterWorkspaces.List(userInfo, labels.Everything(), fields.Everything())
-	if err != nil {
-		return nil, err
-	}
-	var existingClusterWorkspace *tenancyv1alpha1.ClusterWorkspace
-	for _, ws := range obj.Items {
-		if ws.Name == workspace.Name && logicalcluster.From(&ws).String() == logicalcluster.From(workspace).String() {
-			existingClusterWorkspace = workspace
-			break
-		}
-	}
-
-	if existingClusterWorkspace == nil {
-		return nil, kerrors.NewNotFound(tenancyv1beta1.Resource("workspaces"), name)
-	}
-
-	return existingClusterWorkspace, nil
 }
 
 type RoleType string
@@ -454,6 +422,12 @@ func InternalListOptionsToSelectors(options *metainternal.ListOptions) (labels.S
 		field = options.FieldSelector
 	}
 	return label, field
+}
+
+var decisions = map[authorizer.Decision]string{
+	authorizer.DecisionAllow:     "allowed",
+	authorizer.DecisionDeny:      "denied",
+	authorizer.DecisionNoOpinion: "denied",
 }
 
 /*
@@ -707,13 +681,36 @@ func (s *REST) Delete(ctx context.Context, name string, deleteValidation rest.Va
 	return nil, false, errorToReturn
 }
 
-var decisions = map[authorizer.Decision]string{
-	authorizer.DecisionAllow:     "allowed",
-	authorizer.DecisionDeny:      "denied",
-	authorizer.DecisionNoOpinion: "denied",
-}
+
 
 func HasManagedCluster(cluterName string) bool {
 	return true
 }
 */
+
+func printContextInternals(ctx interface{}, inner bool) {
+	contextValues := reflect.ValueOf(ctx).Elem()
+	contextKeys := reflect.TypeOf(ctx).Elem()
+
+	if !inner {
+		fmt.Printf("\nFields for %s.%s\n", contextKeys.PkgPath(), contextKeys.Name())
+	}
+
+	if contextKeys.Kind() == reflect.Struct {
+		for i := 0; i < contextValues.NumField(); i++ {
+			reflectValue := contextValues.Field(i)
+			reflectValue = reflect.NewAt(reflectValue.Type(), unsafe.Pointer(reflectValue.UnsafeAddr())).Elem()
+
+			reflectField := contextKeys.Field(i)
+
+			if reflectField.Name == "Context" {
+				printContextInternals(reflectValue.Interface(), true)
+			} else {
+				fmt.Printf("field name: %+v\n", reflectField.Name)
+				fmt.Printf("value: %+v\n", reflectValue.Interface())
+			}
+		}
+	} else {
+		fmt.Printf("context is empty (int)\n")
+	}
+}

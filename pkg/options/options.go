@@ -29,7 +29,7 @@ import (
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/rootapiserver"
 	ocmoptions "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/options"
 
-	workinformer "open-cluster-management.io/api/client/work/informers/externalversions"
+	manifestworkinformer "open-cluster-management.io/api/client/work/informers/externalversions/work/v1"
 )
 
 const virtualWorkspacesFlagPrefix = "virtual-workspaces-"
@@ -63,10 +63,17 @@ func (o *Options) NewVirtualWorkspaces(
 	kcpClusterClient kcpclient.ClusterInterface,
 	wildcardKubeInformers informers.SharedInformerFactory,
 	wildcardKcpInformers kcpinformer.SharedInformerFactory,
-	workinformer workinformer.SharedInformerFactory,
+	manifestWorkInformer manifestworkinformer.ManifestWorkInformer,
 ) (extraInformers []rootapiserver.InformerStart, workspaces []framework.VirtualWorkspace, err error) {
 
-	inf, vws, err := o.OCM.NewVirtualWorkspaces(rootPathPrefix, kubeClusterClient, dynamicClusterClient, kcpClusterClient, wildcardKubeInformers, wildcardKcpInformers, workinformer)
+	inf, vws, err := o.OCM.NewVirtualWorkspaces(
+		rootPathPrefix,
+		kubeClusterClient,
+		dynamicClusterClient,
+		kcpClusterClient,
+		wildcardKubeInformers,
+		wildcardKcpInformers,
+		manifestWorkInformer)
 	if err != nil {
 		return nil, nil, err
 	}

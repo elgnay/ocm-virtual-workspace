@@ -50,9 +50,10 @@ import (
 	manifestworkbuilder "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/builder"
 	manifestworkcache "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/cache"
 	manifestworkregistry "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/manifestworks/registry"
+	ocmworkspace "open-cluster-management.io/ocm-virtual-workspace/pkg/ocm/workspace"
 
 	workclientset "open-cluster-management.io/api/client/work/clientset/versioned"
-	workinformer "open-cluster-management.io/api/client/work/informers/externalversions"
+	manifestworkinformer "open-cluster-management.io/api/client/work/informers/externalversions/work/v1"
 	ocmopenapi "open-cluster-management.io/api/openapi"
 	workapiv1 "open-cluster-management.io/api/work/v1"
 
@@ -61,7 +62,14 @@ import (
 
 const WorkspacesVirtualWorkspaceName string = "ocm"
 
-func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces workspaceinformer.ClusterWorkspaceInformer, wildcardsRbacInformers rbacinformers.Interface, kubeClusterClient kubernetes.ClusterInterface, kcpClusterClient kcpclient.ClusterInterface, workinformer workinformer.SharedInformerFactory) framework.VirtualWorkspace {
+func BuildVirtualWorkspace(
+	rootPathPrefix string,
+	wildcardsClusterWorkspaces workspaceinformer.ClusterWorkspaceInformer,
+	wildcardsRbacInformers rbacinformers.Interface,
+	kubeClusterClient kubernetes.ClusterInterface,
+	kcpClusterClient kcpclient.ClusterInterface,
+	manifestWorkInformer manifestworkinformer.ManifestWorkInformer,
+) framework.VirtualWorkspace {
 	crbInformer := wildcardsRbacInformers.ClusterRoleBindings()
 	_ = workspaceregistry.AddNameIndexers(crbInformer)
 
@@ -80,7 +88,7 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 
 	// for manifestworks
 	var rootManifestWorkAuthorizationCache *manifestworkauth.AuthorizationCache
-	var globalManifestWorkCache *manifestworkcache.ManifestWorkCache
+	var manifestWorkCache *manifestworkcache.ManifestWorkCache
 
 	return &fixedgvs.FixedGroupVersionsVirtualWorkspace{
 		Name: WorkspacesVirtualWorkspaceName,
@@ -95,7 +103,7 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 			}
 
 			// manifestworks
-			if globalManifestWorkCache == nil || !globalManifestWorkCache.HasSynced() {
+			if manifestWorkCache == nil || !manifestWorkCache.HasSynced() {
 				return errors.New("ManifestWorkCache is not ready for access")
 			}
 			if rootManifestWorkAuthorizationCache == nil || !rootManifestWorkAuthorizationCache.ReadyForAccess() {
@@ -123,12 +131,18 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 				return
 			}
 			org, managedCusterName := segments[0], segments[1]
-			if !workspaceregistry.HasManagedCluster(managedCusterName) {
-				return
-			}
 			//fmt.Printf("++++>RootPathResolver(): org=%s\n", org)
-			completedContext = context.WithValue(completedContext, workspaceregistry.WorkspacesManagedClusterKey, managedCusterName)
-			completedContext = context.WithValue(completedContext, workspaceregistry.WorkspacesOrgKey, logicalcluster.New(org))
+			completedContext = context.WithValue(completedContext, ocmworkspace.ManagedClusterNameKey, managedCusterName)
+			completedContext = context.WithValue(completedContext, ocmworkspace.WorkspaceNameKey, logicalcluster.New(org))
+
+			parts := strings.SplitN(urlPath, "/namespaces/", 2)
+			if len(parts) == 2 {
+				strs := strings.SplitN(parts[1], "/", 2)
+				if len(strs) > 0 {
+					completedContext = context.WithValue(completedContext, ocmworkspace.NamespaceKey, strs[0])
+				}
+			}
+
 			//fmt.Printf("++++>RootPathResolver(): org=%v\n", completedContext.Value(workspaceregistry.WorkspacesOrgKey))
 			prefixToStrip = rootPathPrefix + strings.Join(segments[:2], "/")
 
@@ -182,7 +196,13 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 						return nil, err
 					}
 
-					workspacesRest := workspaceregistry.NewREST(kcpClusterClient.Cluster(tenancyv1alpha1.RootCluster).TenancyV1alpha1(), kubeClusterClient, kcpClusterClient, globalClusterWorkspaceCache, crbInformer, orgListener.FilteredClusterWorkspaces)
+					workspacesRest := workspaceregistry.NewREST(
+						kcpClusterClient.Cluster(tenancyv1alpha1.RootCluster).TenancyV1alpha1(),
+						kubeClusterClient,
+						kcpClusterClient,
+						globalClusterWorkspaceCache,
+						crbInformer,
+						orgListener.FilteredClusterWorkspaces)
 					return map[string]fixedgvs.RestStorageBuilder{
 						"workspaces": func(apiGroupAPIServerConfig genericapiserver.CompletedConfig) (rest.Storage, error) {
 							return workspacesRest, nil
@@ -195,33 +215,17 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 				AddToScheme:        workapiv1.AddToScheme,
 				OpenAPIDefinitions: compositeGetOpenAPIDefinitions,
 				BootstrapRestResources: func(mainConfig genericapiserver.CompletedConfig) (map[string]fixedgvs.RestStorageBuilder, error) {
-					//rootReviewer := manifestworkauth.NewReviewer(rootSubjectLocator)
-					globalManifestWorkCache = manifestworkcache.NewManifestWorkCache(wildcardsClusterWorkspaces.Informer(),
+					manifestWorkCache = manifestworkcache.NewManifestWorkCache(manifestWorkInformer.Informer(),
 						func(lclusterName logicalcluster.Name) (*workclientset.Clientset, error) {
 							return nil, nil
 						})
-
-					/*
-						rootManifestWorkAuthorizationCache = manifestworkauth.NewAuthorizationCache(
-							workinformer.Work().V1().ManifestWorks().Lister(),
-							workinformer.Work().V1().ManifestWorks().Informer(),
-							rootReviewer,
-							*manifestworkauth.NewAttributesBuilder().
-								Verb("get").
-								Resource(workapiv1.SchemeGroupVersion.WithResource("manifestworks"), "").
-								AttributesRecord,
-							rootRBACInformers,
-						)
-					*/
-
 					workspaceListener := manifestworkbuilder.NewWorkspaceListener(wildcardsClusterWorkspaces, func(orgClusterName logicalcluster.Name, initialWatchers []manifestworkauth.CacheWatcher) manifestworkregistry.FilteredManifestWorkWorkspace {
 						return manifestworkbuilder.CreateAndStartManifestWorkWorkspace(
 							orgClusterName,
 							rbacwrapper.FilterInformers(orgClusterName, wildcardsRbacInformers),
-							workinformer.Work().V1().ManifestWorks(),
+							manifestWorkInformer,
 							initialWatchers)
 					})
-
 					if err := mainConfig.AddPostStartHook("clusterworkspaces.kcp.dev-manifestworkauthorizationcache", func(context genericapiserver.PostStartHookContext) error {
 						for _, informer := range []cache.SharedIndexInformer{
 							wildcardsClusterWorkspaces.Informer(),
@@ -229,22 +233,20 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 							wildcardsRbacInformers.RoleBindings().Informer(),
 							wildcardsRbacInformers.ClusterRoles().Informer(),
 							wildcardsRbacInformers.Roles().Informer(),
-							workinformer.Work().V1().ManifestWorks().Informer(),
+							manifestWorkInformer.Informer(),
 						} {
 							if !cache.WaitForNamedCacheSync("manifestworkauthorizationcache", context.StopCh, informer.HasSynced) {
 								return errors.New("informer not synced")
 							}
 						}
-						//rootManifestWorkAuthorizationCache.Run(1*time.Second, context.StopCh)
 						return nil
 					}); err != nil {
 						return nil, err
 					}
 
 					manifestworksRest := manifestworkregistry.NewREST(
-						globalManifestWorkCache,
-						workspaceListener.ListWorkspaceNames,
-						workspaceListener.FilteredManifestWorkWorkspace,
+						manifestWorkCache,
+						kubeClusterClient,
 						workspaceListener.ManifestWorkWorkspaces,
 					)
 					return map[string]fixedgvs.RestStorageBuilder{
@@ -252,58 +254,6 @@ func BuildVirtualWorkspace(rootPathPrefix string, wildcardsClusterWorkspaces wor
 							return manifestworksRest, nil
 						},
 					}, nil
-
-					/*
-						rootRBACInformers := rbacwrapper.FilterInformers(tenancyv1alpha1.RootCluster, wildcardsRbacInformers)
-						rootSubjectLocator := frameworkrbac.NewSubjectLocator(rootRBACInformers)
-						rootReviewer := workspaceauth.NewReviewer(rootSubjectLocator)
-						rootClusterWorkspaceInformer := tenancywrapper.FilterClusterWorkspaceInformer(tenancyv1alpha1.RootCluster, wildcardsClusterWorkspaces)
-
-						globalClusterWorkspaceCache = workspacecache.NewClusterWorkspaceCache(wildcardsClusterWorkspaces.Informer(), kcpClusterClient)
-
-						rootWorkspaceAuthorizationCache = workspaceauth.NewAuthorizationCache(
-							rootClusterWorkspaceInformer.Lister(),
-							rootClusterWorkspaceInformer.Informer(),
-							rootReviewer,
-							*workspaceauth.NewAttributesBuilder().
-								Verb("access").
-								Resource(tenancyv1alpha1.SchemeGroupVersion.WithResource("clusterworkspaces"), "content").
-								AttributesRecord,
-							rootRBACInformers,
-						)
-
-						orgListener := NewOrgListener(wildcardsClusterWorkspaces, func(orgClusterName logicalcluster.Name, initialWatchers []workspaceauth.CacheWatcher) registry.FilteredClusterWorkspaces {
-							return CreateAndStartOrg(
-								rbacwrapper.FilterInformers(orgClusterName, wildcardsRbacInformers),
-								tenancywrapper.FilterClusterWorkspaceInformer(orgClusterName, wildcardsClusterWorkspaces),
-								initialWatchers)
-						})
-
-						if err := mainConfig.AddPostStartHook("clusterworkspaces.kcp.dev-workspaceauthorizationcache", func(context genericapiserver.PostStartHookContext) error {
-							for _, informer := range []cache.SharedIndexInformer{
-								wildcardsClusterWorkspaces.Informer(),
-								wildcardsRbacInformers.ClusterRoleBindings().Informer(),
-								wildcardsRbacInformers.RoleBindings().Informer(),
-								wildcardsRbacInformers.ClusterRoles().Informer(),
-								wildcardsRbacInformers.Roles().Informer(),
-							} {
-								if !cache.WaitForNamedCacheSync("workspaceauthorizationcache", context.StopCh, informer.HasSynced) {
-									return errors.New("informer not synced")
-								}
-							}
-							rootWorkspaceAuthorizationCache.Run(1*time.Second, context.StopCh)
-							return nil
-						}); err != nil {
-							return nil, err
-						}
-
-						workspacesRest := registry.NewREST(kcpClusterClient.Cluster(tenancyv1alpha1.RootCluster).TenancyV1alpha1(), kubeClusterClient, kcpClusterClient, globalClusterWorkspaceCache, crbInformer, orgListener.FilteredClusterWorkspaces)
-						return map[string]fixedgvs.RestStorageBuilder{
-							"manifestworks": func(apiGroupAPIServerConfig genericapiserver.CompletedConfig) (rest.Storage, error) {
-								return workspacesRest, nil
-							},
-						}, nil
-					*/
 				},
 			},
 		},

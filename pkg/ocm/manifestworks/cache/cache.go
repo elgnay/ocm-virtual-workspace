@@ -36,6 +36,10 @@ type GetWorkClient func(lclusterName logicalcluster.Name) (*workclientset.Client
 // NewClusterWorkspaceCache returns a wrapper around an informer. It serves from the informer, and on cache-miss
 // it looks up through the given client.
 func NewManifestWorkCache(manifestWorks cache.SharedIndexInformer, getWorkClient GetWorkClient) *ManifestWorkCache {
+	// nolint: errcheck
+	manifestWorks.AddIndexers(cache.Indexers{
+		"PorjectedNamespcaedName": indexByPorjectedNamespcaedName,
+	})
 	return &ManifestWorkCache{
 		GetWorkClient: getWorkClient,
 		Store:         manifestWorks.GetIndexer(),
@@ -47,6 +51,22 @@ type ManifestWorkCache struct {
 	GetWorkClient GetWorkClient
 	Store         cache.Indexer
 	HasSynced     cache.InformerSynced
+}
+
+func (c *ManifestWorkCache) GetByProjectedNamespacedName(name string) ([]*workapiv1.ManifestWork, error) {
+	others, err := c.Store.ByIndex("PorjectedNamespcaedName", name)
+	if err != nil {
+		return nil, err
+	}
+
+	var matched []*workapiv1.ManifestWork
+	for _, object := range others {
+		if work, ok := object.(*workapiv1.ManifestWork); ok {
+			matched = append(matched, work)
+		}
+	}
+
+	return matched, nil
 }
 
 func (c *ManifestWorkCache) Get(lclusterName logicalcluster.Name, namespace, name string) (*workapiv1.ManifestWork, error) {

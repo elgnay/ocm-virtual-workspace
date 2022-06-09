@@ -5,5 +5,5 @@ metadata:
 rules:
 - apiGroups: ["work.open-cluster-management.io"]
   resources: ["manifestworks"]
-  resourceNames: ["work2"]
-  verbs: ["get", "list", "watch"]
+  resourceNames: ["work2", "work2-1"]
+  verbs: ["get", "watch"]

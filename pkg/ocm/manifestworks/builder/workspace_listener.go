@@ -95,45 +95,12 @@ func (l *workspaceListener) Stop() {
 	}
 }
 
-func (l *workspaceListener) ListWorkspaceNames() []logicalcluster.Name {
-	names := []logicalcluster.Name{}
-
-	for k := range l.manifestWorkWorkspaces {
-		names = append(names, k)
-	}
-
-	return names
-}
-
-func (l *workspaceListener) ManifestWorkWorkspaces() []registry.FilteredManifestWorkWorkspace {
-	workspaces := []registry.FilteredManifestWorkWorkspace{}
-	for _, v := range l.manifestWorkWorkspaces {
-		workspaces = append(workspaces, v)
+func (l *workspaceListener) ManifestWorkWorkspaces() map[logicalcluster.Name]registry.FilteredManifestWorkWorkspace {
+	workspaces := map[logicalcluster.Name]registry.FilteredManifestWorkWorkspace{}
+	for k, v := range l.manifestWorkWorkspaces {
+		workspaces[k] = v
 	}
 	return workspaces
-}
-
-// FilteredClusterWorkspaces returns the cluster workspace provider or nil if it is started (does not mean it does
-// not exist, we just don't know here).
-// Note: because the defining ClusterWorkspace of the parent can be on a different shard, we cannot know here.
-func (l *workspaceListener) FilteredManifestWorkWorkspace(orgName logicalcluster.Name) registry.FilteredManifestWorkWorkspace {
-	// fast path
-	l.lock.RLock()
-	cws, found := l.manifestWorkWorkspaces[orgName]
-	l.lock.RUnlock()
-	if found {
-		return cws
-	}
-
-	// slow path
-	l.lock.Lock()
-	defer l.lock.Unlock()
-	if _, found := l.manifestWorkWorkspaces[orgName]; found {
-		return cws
-	}
-
-	l.manifestWorkWorkspaces[orgName] = &preCreationManifestWorkWorkspace{}
-	return l.manifestWorkWorkspaces[orgName]
 }
 
 func (l *workspaceListener) addClusterWorkspace(obj interface{}) {

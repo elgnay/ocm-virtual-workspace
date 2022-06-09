@@ -679,7 +679,3 @@ var decisions = map[authorizer.Decision]string{
 	authorizer.DecisionDeny:      "denied",
 	authorizer.DecisionNoOpinion: "denied",
 }
-
-func HasManagedCluster(cluterName string) bool {
-	return true
-}
