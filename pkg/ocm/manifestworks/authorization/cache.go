@@ -32,7 +32,6 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	rbacv1informers "k8s.io/client-go/informers/rbac/v1"
-	rbacv1listers "k8s.io/client-go/listers/rbac/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -44,123 +43,6 @@ import (
 	workapiv1 "open-cluster-management.io/api/work/v1"
 )
 
-// Lister enforces ability to enumerate a resource based on role
-type Lister interface {
-	// List returns the list of ClusterWorkspace items that the user can access
-	List(user user.Info, labelSelector labels.Selector, fieldSelector fields.Selector) (*workapiv1.ManifestWorkList, error)
-}
-
-// subjectRecord is a cache record for the set of workspaces a subject can access
-type subjectRecord struct {
-	subject string
-	keys    sets.String
-}
-
-// reviewRequest is the resource we want to review
-type reviewRequest struct {
-	key string
-	// the resource version of the workspace that was observed to make this request
-	resourceVersion string
-	// the map of role uid to resource version that was observed to make this request
-	roleUIDToResourceVersion map[types.UID]string
-	// the map of role binding uid to resource version that was observed to make this request
-	roleBindingUIDToResourceVersion map[types.UID]string
-}
-
-// reviewRecord is a cache record for the result of a resource access review
-type reviewRecord struct {
-	*reviewRequest
-	users  []string
-	groups []string
-}
-
-// reviewRecordKeyFn is a key func for reviewRecord objects
-func reviewRecordKeyFn(obj interface{}) (string, error) {
-	reviewRecord, ok := obj.(*reviewRecord)
-	if !ok {
-		return "", fmt.Errorf("expected reviewRecord")
-	}
-	return reviewRecord.key, nil
-}
-
-// subjectRecordKeyFn is a key func for subjectRecord objects
-func subjectRecordKeyFn(obj interface{}) (string, error) {
-	subjectRecord, ok := obj.(*subjectRecord)
-	if !ok {
-		return "", fmt.Errorf("expected subjectRecord")
-	}
-	return subjectRecord.subject, nil
-}
-
-type skipSynchronizer interface {
-	// SkipSynchronize returns true if if its safe to skip synchronization of the cache based on provided token from previous observation
-	SkipSynchronize(prevState string, versionedObjects ...LastSyncResourceVersioner) (skip bool, currentState string)
-}
-
-// LastSyncResourceVersioner is any object that can divulge a LastSyncResourceVersion
-type LastSyncResourceVersioner interface {
-	LastSyncResourceVersion() string
-}
-
-type unionLastSyncResourceVersioner []LastSyncResourceVersioner
-
-func (u unionLastSyncResourceVersioner) LastSyncResourceVersion() string {
-	resourceVersions := []string{}
-	for _, versioner := range u {
-		resourceVersions = append(resourceVersions, versioner.LastSyncResourceVersion())
-	}
-	return strings.Join(resourceVersions, "")
-}
-
-type statelessSkipSynchronizer struct{}
-
-func (rs *statelessSkipSynchronizer) SkipSynchronize(prevState string, versionedObjects ...LastSyncResourceVersioner) (skip bool, currentState string) {
-	//fmt.Printf("++++>statelessSkipSynchronizer.SkipSynchronize(): prevState=%s\n", prevState)
-	resourceVersions := []string{}
-	for i := range versionedObjects {
-		resourceVersions = append(resourceVersions, versionedObjects[i].LastSyncResourceVersion())
-	}
-	currentState = strings.Join(resourceVersions, ",")
-	//fmt.Printf("++++>statelessSkipSynchronizer.SkipSynchronize(): currentState=%s\n", currentState)
-	skip = currentState == prevState
-
-	return skip, currentState
-}
-
-type neverSkipSynchronizer struct{}
-
-func (s *neverSkipSynchronizer) SkipSynchronize(prevState string, versionedObjects ...LastSyncResourceVersioner) (bool, string) {
-	return false, ""
-}
-
-type SyncedClusterRoleLister interface {
-	rbacv1listers.ClusterRoleLister
-	LastSyncResourceVersioner
-}
-
-type SyncedClusterRoleBindingLister interface {
-	rbacv1listers.ClusterRoleBindingLister
-	LastSyncResourceVersioner
-}
-
-type syncedClusterRoleLister struct {
-	rbacv1listers.ClusterRoleLister
-	versioner LastSyncResourceVersioner
-}
-
-func (l syncedClusterRoleLister) LastSyncResourceVersion() string {
-	return l.versioner.LastSyncResourceVersion()
-}
-
-type syncedClusterRoleBindingLister struct {
-	rbacv1listers.ClusterRoleBindingLister
-	versioner LastSyncResourceVersioner
-}
-
-func (l syncedClusterRoleBindingLister) LastSyncResourceVersion() string {
-	return l.versioner.LastSyncResourceVersion()
-}
-
 // AuthorizationCache maintains a cache on the set of workspaces a user or group can access.
 type AuthorizationCache struct {
 	// allKnownManifestWorks we track all the known workspaces, so we can detect deletes.
@@ -171,7 +53,9 @@ type AuthorizationCache struct {
 
 	clusterRoleLister             SyncedClusterRoleLister
 	clusterRoleBindingLister      SyncedClusterRoleBindingLister
-	roleLastSyncResourceVersioner LastSyncResourceVersioner
+	roleLister                    SyncedRoleLister
+	roleBindingLister             SyncedRoleBindingLister
+	lastSyncRBACResourceVersioner LastSyncResourceVersioner
 
 	reviewRecordStore       cache.Store
 	userSubjectRecordStore  cache.Store
@@ -179,6 +63,8 @@ type AuthorizationCache struct {
 
 	clusterBindingResourceVersions sets.String
 	clusterRoleResourceVersions    sets.String
+	bindingResourceVersions        sets.String
+	roleResourceVersions           sets.String
 
 	skip      skipSynchronizer
 	lastState string
@@ -213,6 +99,14 @@ func NewAuthorizationCache(
 		informers.ClusterRoleBindings().Lister(),
 		informers.ClusterRoleBindings().Informer(),
 	}
+	srLister := syncedRoleLister{
+		informers.Roles().Lister(),
+		informers.Roles().Informer(),
+	}
+	srbLister := syncedRoleBindingLister{
+		informers.RoleBindings().Lister(),
+		informers.RoleBindings().Informer(),
+	}
 	ac := AuthorizationCache{
 		clusterName:           clusterName,
 		allKnownManifestWorks: sets.String{},
@@ -223,7 +117,9 @@ func NewAuthorizationCache(
 
 		clusterRoleLister:             scrLister,
 		clusterRoleBindingLister:      scrbLister,
-		roleLastSyncResourceVersioner: unionLastSyncResourceVersioner{scrLister, scrbLister},
+		roleLister:                    srLister,
+		roleBindingLister:             srbLister,
+		lastSyncRBACResourceVersioner: unionLastSyncResourceVersioner{scrLister, scrbLister, srLister, srbLister},
 
 		reviewRecordStore:       cache.NewStore(reviewRecordKeyFn),
 		userSubjectRecordStore:  cache.NewStore(subjectRecordKeyFn),
@@ -239,7 +135,7 @@ func NewAuthorizationCache(
 	ac.syncHandler = ac.syncRequest
 	ac.rwMutex = sync.RWMutex{}
 
-	fmt.Printf("##########++++>Create AuthorizationCache for workspace %q\n", clusterName.String())
+	fmt.Printf("++++>Create AuthorizationCache for workspace %q\n", clusterName.String())
 	return &ac
 }
 
@@ -332,22 +228,24 @@ func (ac *AuthorizationCache) purgeDeletedWorkspaces(oldWorkspaces, newWorkspace
 func (ac *AuthorizationCache) invalidateCache() bool {
 	invalidateCache := false
 
+	// handle clusterroles
 	clusterRoleList, err := ac.clusterRoleLister.List(labels.Everything())
 	if err != nil {
 		utilruntime.HandleError(err)
 		return invalidateCache
 	}
 
-	crTemporaryVersions := sets.NewString()
+	clusterRoleResourceVersions := sets.NewString()
 	for _, clusterRole := range clusterRoleList {
-		crTemporaryVersions.Insert(clusterRole.ResourceVersion)
+		clusterRoleResourceVersions.Insert(clusterRole.ResourceVersion)
 	}
-	if (len(ac.clusterRoleResourceVersions) != len(crTemporaryVersions)) || !ac.clusterRoleResourceVersions.HasAll(crTemporaryVersions.List()...) {
-		fmt.Printf("++++>AuthorizationCache[%s].invalidateCache(clusterRole): old=%s, new=%s\n", ac.clusterName.String(), strings.Join(ac.clusterRoleResourceVersions.List(), ","), strings.Join(crTemporaryVersions.List(), ","))
+	if (len(ac.clusterRoleResourceVersions) != len(clusterRoleResourceVersions)) || !ac.clusterRoleResourceVersions.HasAll(clusterRoleResourceVersions.List()...) {
+		fmt.Printf("++++>AuthorizationCache[%s].invalidateCache(clusterRole): old=%s, new=%s\n", ac.clusterName.String(), strings.Join(ac.clusterRoleResourceVersions.List(), ","), strings.Join(clusterRoleResourceVersions.List(), ","))
 		invalidateCache = true
-		ac.clusterRoleResourceVersions = crTemporaryVersions
+		ac.clusterRoleResourceVersions = clusterRoleResourceVersions
 	}
 
+	// handle clusterrolebindings
 	clusterRoleBindingList, err := ac.clusterRoleBindingLister.List(labels.Everything())
 	if err != nil {
 		utilruntime.HandleError(err)
@@ -355,14 +253,49 @@ func (ac *AuthorizationCache) invalidateCache() bool {
 	}
 
 	//temporaryVersions.Delete(temporaryVersions.List()...)
-	crbTemporaryVersions := sets.NewString()
+	clusterBindingResourceVersions := sets.NewString()
 	for _, clusterRoleBinding := range clusterRoleBindingList {
-		crbTemporaryVersions.Insert(clusterRoleBinding.ResourceVersion)
+		clusterBindingResourceVersions.Insert(clusterRoleBinding.ResourceVersion)
 	}
-	if (len(ac.clusterBindingResourceVersions) != len(crbTemporaryVersions)) || !ac.clusterBindingResourceVersions.HasAll(crbTemporaryVersions.List()...) {
-		fmt.Printf("++++>AuthorizationCache[%s].invalidateCache(clusterRoleBinding): old=%s, new=%s\n", ac.clusterName.String(), strings.Join(ac.clusterBindingResourceVersions.List(), ","), strings.Join(crbTemporaryVersions.List(), ","))
+	if (len(ac.clusterBindingResourceVersions) != len(clusterBindingResourceVersions)) || !ac.clusterBindingResourceVersions.HasAll(clusterBindingResourceVersions.List()...) {
+		fmt.Printf("++++>AuthorizationCache[%s].invalidateCache(clusterRoleBinding): old=%s, new=%s\n", ac.clusterName.String(), strings.Join(ac.clusterBindingResourceVersions.List(), ","), strings.Join(clusterBindingResourceVersions.List(), ","))
 		invalidateCache = true
-		ac.clusterBindingResourceVersions = crbTemporaryVersions
+		ac.clusterBindingResourceVersions = clusterBindingResourceVersions
+	}
+
+	// handle roles
+	roleList, err := ac.roleLister.List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(err)
+		return invalidateCache
+	}
+
+	roleResourceVersions := sets.NewString()
+	for _, role := range roleList {
+		roleResourceVersions.Insert(role.ResourceVersion)
+	}
+	if (len(ac.roleResourceVersions) != len(roleResourceVersions)) || !ac.roleResourceVersions.HasAll(roleResourceVersions.List()...) {
+		fmt.Printf("++++>AuthorizationCache[%s].invalidateCache(Role): old=%s, new=%s\n", ac.clusterName.String(), strings.Join(ac.roleResourceVersions.List(), ","), strings.Join(roleResourceVersions.List(), ","))
+		invalidateCache = true
+		ac.roleResourceVersions = roleResourceVersions
+	}
+
+	// handle rolebindings
+	roleBindingList, err := ac.roleBindingLister.List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(err)
+		return invalidateCache
+	}
+
+	//temporaryVersions.Delete(temporaryVersions.List()...)
+	bindingResourceVersions := sets.NewString()
+	for _, roleBinding := range roleBindingList {
+		bindingResourceVersions.Insert(roleBinding.ResourceVersion)
+	}
+	if (len(ac.bindingResourceVersions) != len(bindingResourceVersions)) || !ac.bindingResourceVersions.HasAll(bindingResourceVersions.List()...) {
+		fmt.Printf("++++>AuthorizationCache[%s].invalidateCache(RoleBinding): old=%s, new=%s\n", ac.clusterName.String(), strings.Join(ac.bindingResourceVersions.List(), ","), strings.Join(bindingResourceVersions.List(), ","))
+		invalidateCache = true
+		ac.bindingResourceVersions = bindingResourceVersions
 	}
 	return invalidateCache
 }
@@ -373,7 +306,10 @@ func (ac *AuthorizationCache) synchronize() {
 	defer ac.rwMutex.Unlock()
 
 	// if none of our internal reflectors changed, then we can skip reviewing the cache
-	skip, currentState := ac.skip.SkipSynchronize(ac.lastState, ac.lastSyncResourceVersioner, ac.roleLastSyncResourceVersioner)
+	skip, currentState := ac.skip.SkipSynchronize(
+		ac.lastState,
+		ac.lastSyncResourceVersioner,
+		ac.lastSyncRBACResourceVersioner)
 	//fmt.Printf("++++>AuthorizationCache[%s].synchronize(): currentState=%v\n", ac.clusterName.String(), currentState)
 	if skip {
 		//fmt.Printf("++++>AuthorizationCache[%s].synchronize(): skip=true\n", ac.clusterName.String())
@@ -438,7 +374,11 @@ func (ac *AuthorizationCache) syncRequest(request *reviewRequest, userSubjectRec
 
 	//fmt.Printf("++++>AuthorizationCache[%s].syncRequest(): manifestWork=%s, reviewAttributes=%v\n", ac.clusterName.String(), manifestWorkKey, reviewAttributes)
 	review := ac.reviewer.Review(reviewAttributes)
-	//fmt.Printf("++++>AuthorizationCache[%s].syncRequest(): manifestWork=%s, users=%s, groups=%s\n", ac.clusterName.String(), manifestWorkKey, strings.Join(review.Users, ","), strings.Join(review.Groups, ","))
+	fmt.Printf("@@@@@@@@@@++++>AuthorizationCache[%s].syncRequest(): manifestWork=%s, users=%s, groups=%s\n",
+		ac.clusterName.String(),
+		manifestWorkKey,
+		strings.Join(review.Users, ","),
+		strings.Join(review.Groups, ","))
 
 	usersToRemove := sets.NewString()
 	groupsToRemove := sets.NewString()
@@ -594,6 +534,22 @@ func skipReview(request *reviewRequest, lastKnownValue *reviewRecord) bool {
 		return false
 	}
 
+	// if you see a new clusterrole binding, or a newer version, we need to do a review
+	for k, v := range request.clusterRoleBindingUIDToResourceVersion {
+		oldValue, exists := lastKnownValue.clusterRoleBindingUIDToResourceVersion[k]
+		if !exists || v != oldValue {
+			return false
+		}
+	}
+
+	// if you see a new clusterrole, or a newer version, we need to do a review
+	for k, v := range request.clusterRoleUIDToResourceVersion {
+		oldValue, exists := lastKnownValue.clusterRoleUIDToResourceVersion[k]
+		if !exists || v != oldValue {
+			return false
+		}
+	}
+
 	// if you see a new role binding, or a newer version, we need to do a review
 	for k, v := range request.roleBindingUIDToResourceVersion {
 		oldValue, exists := lastKnownValue.roleBindingUIDToResourceVersion[k]
@@ -609,6 +565,7 @@ func skipReview(request *reviewRequest, lastKnownValue *reviewRecord) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -662,13 +619,25 @@ func cacheReviewRecord(request *reviewRequest, lastKnownValue *reviewRecord, rev
 	//fmt.Printf("++++>cacheReviewRecord(): review=%+v\n", review)
 	//fmt.Printf("++++>cacheReviewRecord(): reviewRecordStore=%s\n", strings.Join(reviewRecordStore.ListKeys(), ","))
 	reviewRecord := &reviewRecord{
-		reviewRequest: &reviewRequest{key: request.key, roleUIDToResourceVersion: map[types.UID]string{}, roleBindingUIDToResourceVersion: map[types.UID]string{}},
-		groups:        review.Groups,
-		users:         review.Users,
+		reviewRequest: &reviewRequest{
+			key:                                    request.key,
+			clusterRoleUIDToResourceVersion:        map[types.UID]string{},
+			clusterRoleBindingUIDToResourceVersion: map[types.UID]string{},
+			roleUIDToResourceVersion:               map[types.UID]string{},
+			roleBindingUIDToResourceVersion:        map[types.UID]string{},
+		},
+		groups: review.Groups,
+		users:  review.Users,
 	}
 	// keep what we last believe we knew by default
 	if lastKnownValue != nil {
 		reviewRecord.resourceVersion = lastKnownValue.resourceVersion
+		for k, v := range lastKnownValue.clusterRoleUIDToResourceVersion {
+			reviewRecord.clusterRoleUIDToResourceVersion[k] = v
+		}
+		for k, v := range lastKnownValue.clusterRoleBindingUIDToResourceVersion {
+			reviewRecord.clusterRoleBindingUIDToResourceVersion[k] = v
+		}
 		for k, v := range lastKnownValue.roleUIDToResourceVersion {
 			reviewRecord.roleUIDToResourceVersion[k] = v
 		}
@@ -680,6 +649,12 @@ func cacheReviewRecord(request *reviewRequest, lastKnownValue *reviewRecord, rev
 	// update the review record relative to what drove this request
 	if len(request.resourceVersion) > 0 {
 		reviewRecord.resourceVersion = request.resourceVersion
+	}
+	for k, v := range request.clusterRoleUIDToResourceVersion {
+		reviewRecord.clusterRoleUIDToResourceVersion[k] = v
+	}
+	for k, v := range request.clusterRoleBindingUIDToResourceVersion {
+		reviewRecord.clusterRoleBindingUIDToResourceVersion[k] = v
 	}
 	for k, v := range request.roleUIDToResourceVersion {
 		reviewRecord.roleUIDToResourceVersion[k] = v

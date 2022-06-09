@@ -216,7 +216,7 @@ func applyTest(t *testing.T, test TestDescription) {
 		},
 	}
 	ctx = apirequest.WithUser(ctx, test.user)
-	ctx = apirequest.WithValue(ctx, WorkspacesScopeKey, test.scope)
+	//ctx = apirequest.WithValue(ctx, WorkspacesScopeKey, test.scope)
 	ctx = apirequest.WithValue(ctx, WorkspacesOrgKey, test.orgName)
 
 	test.apply(t, &storage, ctx, mockKubeClient, mockKCPClient, clusterWorkspaceLister.CheckedUsers, test.TestData)

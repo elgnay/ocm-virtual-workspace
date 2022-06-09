@@ -1,13 +1,13 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: case1
-  namespace: default
+  name: case1-2
+  namespace: cluster1
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: case1
+  name: case1-2
 subjects:
   - kind: User
-    name: alex
+    name: user-1
     apiGroup: rbac.authorization.k8s.io
